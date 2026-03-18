@@ -1,5 +1,5 @@
 {
-  "name": "affine-mcp-server",
+  "name": "@3j-technologies/affine-mcp-server",
   "version": "1.10.1",
   "private": false,
   "type": "module",
@@ -8,10 +8,13 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dawncr0w/affine-mcp-server.git"
+    "url": "git+https://github.com/3j-technologies/affine-mcp-server.git"
   },
   "bugs": {
-    "url": "https://github.com/dawncr0w/affine-mcp-server/issues"
+    "url": "https://github.com/3j-technologies/affine-mcp-server/issues"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "homepage": "https://github.com/dawncr0w/affine-mcp-server#readme",
   "keywords": [
