@@ -1597,27 +1597,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         if (normalized.dataViewMode === "kanban") {
           return createPresetBackedDataViewBlock(blockId, normalized.text, "kanban", "database_kanban");
         }
-        setSysFields(block, blockId, "affine:database");
-        block.set("sys:parent", null);
-        block.set("sys:children", new Y.Array<string>());
-        // Create a default table view so AFFiNE UI renders the database
-        const defaultView = new Y.Map<any>();
-        defaultView.set("id", generateId());
-        defaultView.set("name", "Table View");
-        defaultView.set("mode", "table");
-        defaultView.set("columns", new Y.Array<any>());
-        defaultView.set("filter", { type: "group", op: "and", conditions: [] });
-        defaultView.set("groupBy", null);
-        defaultView.set("sort", null);
-        defaultView.set("header", { titleColumn: null, iconColumn: null });
-        const views = new Y.Array<any>();
-        views.push([defaultView]);
-        block.set("prop:views", views);
-        block.set("prop:title", makeText(content));
-        block.set("prop:cells", new Y.Map<any>());
-        block.set("prop:columns", new Y.Array<any>());
-        block.set("prop:comments", undefined);
-        return { blockId, block, flavour: "affine:database" };
+        // Use the same proven creation path as the preset database
+        return createPresetBackedDataViewBlock(blockId, normalized.text, "table", "database");
       }
       case "data_view": {
         return createPresetBackedDataViewBlock(blockId, normalized.text, normalized.dataViewMode, `data_view_${normalized.dataViewMode}`);
@@ -5447,8 +5428,17 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       dbBlock.set("sys:parent", parentBlock.get("sys:id") || null);
       dbBlock.set("sys:children", new Y.Array<string>());
 
-      // Build column definitions
+      // Create the implicit Title column first (required by AFFiNE UI to render rows)
+      const titleColumnId = generateId();
       const columnsArray = new Y.Array<any>();
+      columnsArray.push([createDatabaseColumnDefinition({
+        id: titleColumnId,
+        name: "Title",
+        type: "title",
+        width: 320,
+      })]);
+
+      // Build user-defined column definitions
       const columnDefs: Array<{ id: string; name: string; type: string; options: Array<{ id: string; value: string; color: string }>; raw: Y.Map<any> }> = [];
 
       for (const colDef of parsed.columns) {
@@ -5482,7 +5472,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       dbBlock.set("prop:columns", columnsArray);
 
-      // Create the default view with columns visible
+      // Create the default view with Title column first, then user columns
       const defaultView = new Y.Map<any>();
       const viewId = generateId();
       defaultView.set("id", viewId);
@@ -5490,6 +5480,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       defaultView.set("mode", parsed.viewMode === "kanban" ? "kanban" : "table");
 
       const viewColumns = new Y.Array<any>();
+      // Add the title column to the view first
+      viewColumns.push([createDatabaseViewColumn(titleColumnId, 320, false)]);
       for (const colDef of columnDefs) {
         const viewCol = new Y.Map<any>();
         viewCol.set("id", colDef.id);
@@ -5501,7 +5493,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       defaultView.set("filter", { type: "group", op: "and", conditions: [] });
       defaultView.set("groupBy", null);
       defaultView.set("sort", null);
-      defaultView.set("header", { titleColumn: null, iconColumn: null });
+      defaultView.set("header", { titleColumn: titleColumnId, iconColumn: "type" });
 
       const viewsArray = new Y.Array<any>();
       viewsArray.push([defaultView]);
