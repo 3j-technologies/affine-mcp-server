@@ -5767,4 +5767,800 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
     createLinkedDatabaseViewHandler as any
   );
+
+  // ─── list_database_views ──────────────────────────────────────────────────
+  const listDatabaseViewsHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const views = ctx.dbBlock.get("prop:views");
+      if (!(views instanceof Y.Array)) {
+        return text({ views: [], message: "Database has no views array" });
+      }
+
+      const result: Array<Record<string, unknown>> = [];
+      views.forEach((view: any) => {
+        if (view instanceof Y.Map) {
+          const viewData: Record<string, unknown> = {
+            id: view.get("id"),
+            name: view.get("name"),
+            mode: view.get("mode"),
+          };
+          // Include filter/sort/groupBy summaries
+          const filter = view.get("filter");
+          if (filter) {
+            const conditions = filter?.conditions ?? (filter instanceof Y.Map ? [] : []);
+            viewData.filterConditionCount = Array.isArray(conditions) ? conditions.length : 0;
+          }
+          const sort = view.get("sort");
+          if (sort) {
+            const sortCols = sort?.columns ?? (sort instanceof Y.Map ? [] : []);
+            viewData.sortColumnCount = Array.isArray(sortCols) ? sortCols.length : 0;
+          }
+          const groupBy = view.get("groupBy");
+          if (groupBy) {
+            viewData.groupByColumnId = groupBy?.columnId ?? (groupBy instanceof Y.Map ? groupBy.get("columnId") : null);
+          }
+          // Check for chart config
+          const chartConfig = view.get("chartConfig");
+          if (chartConfig) {
+            if (chartConfig instanceof Y.Map) {
+              viewData.chartType = chartConfig.get("chartType");
+            } else if (typeof chartConfig === "object") {
+              viewData.chartType = (chartConfig as any).chartType;
+            }
+          }
+          // Count view columns
+          const cols = view.get("columns");
+          if (cols instanceof Y.Array) {
+            viewData.columnCount = cols.length;
+          }
+          result.push(viewData);
+        }
+      });
+
+      return text({ views: result, viewCount: result.length });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "list_database_views",
+    {
+      title: "List Database Views",
+      description: "List all views (table, kanban, chart, etc.) on an AFFiNE database block. Returns view ID, name, mode, and summary info for each view.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+      },
+    },
+    listDatabaseViewsHandler as any
+  );
+
+  // ─── create_chart_view ────────────────────────────────────────────────────
+  const createChartViewHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    name?: string;
+    chartType: string;
+    xColumn?: string;
+    yColumn?: string;
+    aggregation?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const views = ctx.dbBlock.get("prop:views");
+      if (!(views instanceof Y.Array)) throw new Error("Database has no views array");
+
+      // Resolve column names to IDs if provided
+      let xColumnId: string | undefined;
+      if (parsed.xColumn) {
+        const col = findDatabaseColumn(parsed.xColumn, ctx);
+        if (!col) throw new Error(`xColumn '${parsed.xColumn}' not found. Available columns: ${availableDatabaseColumns(ctx)}`);
+        xColumnId = col.id;
+      }
+      let yColumnId: string | undefined;
+      if (parsed.yColumn) {
+        const col = findDatabaseColumn(parsed.yColumn, ctx);
+        if (!col) throw new Error(`yColumn '${parsed.yColumn}' not found. Available columns: ${availableDatabaseColumns(ctx)}`);
+        yColumnId = col.id;
+      }
+
+      const viewId = generateId();
+      const chartView = new Y.Map<any>();
+      chartView.set("id", viewId);
+      chartView.set("name", parsed.name || "Chart View");
+      chartView.set("mode", "chart");
+      chartView.set("filter", { type: "group", op: "and", conditions: [] });
+      chartView.set("sort", null);
+      chartView.set("groupBy", null);
+
+      // Copy columns from first existing view for consistency
+      let headerObj: Record<string, unknown> = {};
+      const viewColumns = new Y.Array<any>();
+      views.forEach((v: any) => {
+        if (v instanceof Y.Map && viewColumns.length === 0) {
+          const existingCols = v.get("columns");
+          if (existingCols instanceof Y.Array) {
+            existingCols.forEach((vc: any) => {
+              if (vc instanceof Y.Map) {
+                const copy = new Y.Map<any>();
+                copy.set("id", vc.get("id"));
+                copy.set("width", vc.get("width") ?? 200);
+                copy.set("hide", vc.get("hide") ?? false);
+                viewColumns.push([copy]);
+              }
+            });
+          }
+          const hdr = v.get("header");
+          if (hdr) {
+            if (hdr instanceof Y.Map) {
+              headerObj = { titleColumn: hdr.get("titleColumn"), iconColumn: hdr.get("iconColumn") };
+            } else if (typeof hdr === "object") {
+              headerObj = { titleColumn: (hdr as any).titleColumn, iconColumn: (hdr as any).iconColumn };
+            }
+          }
+        }
+      });
+      chartView.set("columns", viewColumns);
+      chartView.set("header", headerObj);
+
+      // Chart configuration
+      const chartConfig: Record<string, unknown> = {
+        chartType: parsed.chartType,
+      };
+      if (xColumnId) chartConfig.xField = xColumnId;
+      if (yColumnId) chartConfig.yField = yColumnId;
+      if (parsed.aggregation) chartConfig.aggregation = parsed.aggregation;
+      chartView.set("chartConfig", chartConfig);
+
+      views.push([chartView]);
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        created: true,
+        viewId,
+        databaseBlockId: parsed.databaseBlockId,
+        chartType: parsed.chartType,
+        xColumn: parsed.xColumn || null,
+        yColumn: parsed.yColumn || null,
+        message: `Chart view '${parsed.name || "Chart View"}' added to database. Note: Chart views may require AFFiNE 0.27+ to render in the UI. The view data is stored correctly in the database's prop:views.`,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "create_chart_view",
+    {
+      title: "Create Chart View",
+      description: "Add a chart view to an existing AFFiNE database block. Chart views visualize database data as pie, bar, horizontal-bar, stacked-bar, or line charts. The view is stored in prop:views alongside table/kanban views. Note: Chart rendering in the AFFiNE UI may require version 0.27+.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        name: z.string().optional().describe("View name (default: 'Chart View')"),
+        chartType: z.enum(["pie", "bar", "horizontal-bar", "stacked-bar", "line"]).describe("Chart type"),
+        xColumn: z.string().optional().describe("Column name or ID for x-axis / category field"),
+        yColumn: z.string().optional().describe("Column name or ID for y-axis / value field"),
+        aggregation: z.string().optional().describe("Aggregation function: count, sum, average, min, max"),
+      },
+    },
+    createChartViewHandler as any
+  );
+
+  // ─── update_chart_view ────────────────────────────────────────────────────
+  const updateChartViewHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    viewId: string;
+    name?: string;
+    chartType?: string;
+    xColumn?: string;
+    yColumn?: string;
+    aggregation?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const views = ctx.dbBlock.get("prop:views");
+      if (!(views instanceof Y.Array)) throw new Error("Database has no views");
+
+      let targetView: Y.Map<any> | null = null;
+      views.forEach((view: any) => {
+        if (view instanceof Y.Map && view.get("id") === parsed.viewId) {
+          targetView = view;
+        }
+      });
+      if (!targetView) throw new Error(`View '${parsed.viewId}' not found`);
+
+      const tv = targetView as Y.Map<any>;
+      if (parsed.name) tv.set("name", parsed.name);
+
+      // Build updated chart config
+      const existingConfig = tv.get("chartConfig");
+      const chartConfig: Record<string, unknown> = {};
+      if (existingConfig && typeof existingConfig === "object") {
+        if (existingConfig instanceof Y.Map) {
+          for (const [k, v] of existingConfig) chartConfig[k] = v;
+        } else {
+          Object.assign(chartConfig, existingConfig);
+        }
+      }
+
+      if (parsed.chartType) chartConfig.chartType = parsed.chartType;
+      if (parsed.xColumn) {
+        const col = findDatabaseColumn(parsed.xColumn, ctx);
+        if (!col) throw new Error(`xColumn '${parsed.xColumn}' not found. Available columns: ${availableDatabaseColumns(ctx)}`);
+        chartConfig.xField = col.id;
+      }
+      if (parsed.yColumn) {
+        const col = findDatabaseColumn(parsed.yColumn, ctx);
+        if (!col) throw new Error(`yColumn '${parsed.yColumn}' not found. Available columns: ${availableDatabaseColumns(ctx)}`);
+        chartConfig.yField = col.id;
+      }
+      if (parsed.aggregation) chartConfig.aggregation = parsed.aggregation;
+
+      tv.set("chartConfig", chartConfig);
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        updated: true,
+        viewId: parsed.viewId,
+        databaseBlockId: parsed.databaseBlockId,
+        chartConfig,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "update_chart_view",
+    {
+      title: "Update Chart View",
+      description: "Update the chart configuration on an existing chart view of an AFFiNE database. Can change chart type, x/y columns, aggregation, and view name.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        viewId: z.string().min(1).describe("View ID of the chart view to update"),
+        name: z.string().optional().describe("New view name"),
+        chartType: z.enum(["pie", "bar", "horizontal-bar", "stacked-bar", "line"]).optional().describe("New chart type"),
+        xColumn: z.string().optional().describe("New column name or ID for x-axis / category field"),
+        yColumn: z.string().optional().describe("New column name or ID for y-axis / value field"),
+        aggregation: z.string().optional().describe("New aggregation function: count, sum, average, min, max"),
+      },
+    },
+    updateChartViewHandler as any
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EDGELESS CANVAS TOOLS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Helper: Load a doc and return blocks + socket for edgeless operations
+  async function loadEdgelessDocContext(workspaceId: string, docId: string) {
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    await joinWorkspace(socket, workspaceId);
+
+    const doc = new Y.Doc();
+    const snapshot = await loadDoc(socket, workspaceId, docId);
+    if (!snapshot.missing) {
+      socket.disconnect();
+      throw new Error("Document not found");
+    }
+    Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+
+    const prevSV = Y.encodeStateVector(doc);
+    const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+    return { socket, doc, prevSV, blocks };
+  }
+
+  // Helper: Get the surface block's elements value map
+  function getSurfaceElements(blocks: Y.Map<any>): { surfaceBlock: Y.Map<any>; surfaceId: string; elementsMap: Y.Map<any> } {
+    const surfaceId = findBlockIdByFlavour(blocks, "affine:surface");
+    if (!surfaceId) throw new Error("No affine:surface block found in this document. This may not be an edgeless doc.");
+    const surfaceBlock = blocks.get(surfaceId) as Y.Map<any>;
+
+    const propElements = surfaceBlock.get("prop:elements");
+    let elementsMap: Y.Map<any>;
+    if (propElements instanceof Y.Map) {
+      // AFFiNE stores elements as { type: "$blocksuite:internal:native$", value: Y.Map }
+      const value = propElements.get("value");
+      if (value instanceof Y.Map) {
+        elementsMap = value;
+      } else {
+        // Fallback: prop:elements itself might be the elements map
+        elementsMap = propElements;
+      }
+    } else {
+      throw new Error("Surface block has no prop:elements Y.Map");
+    }
+
+    return { surfaceBlock, surfaceId, elementsMap };
+  }
+
+  // Helper: Generate a fractional index for z-ordering
+  function generateIndex(existingCount: number): string {
+    // Simple approach: use "a0", "a1", etc. AFFiNE uses fractional indexing.
+    return `a${existingCount}`;
+  }
+
+  // ─── get_edgeless_scene ───────────────────────────────────────────────────
+  const getEdgelessSceneHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadEdgelessDocContext(workspaceId, parsed.docId);
+    try {
+      const surfaceId = findBlockIdByFlavour(ctx.blocks, "affine:surface");
+      if (!surfaceId) {
+        return text({ elements: [], children: [], message: "No surface block found in document" });
+      }
+      const surfaceBlock = ctx.blocks.get(surfaceId) as Y.Map<any>;
+
+      // Read elements
+      const elements: Array<Record<string, unknown>> = [];
+      const propElements = surfaceBlock.get("prop:elements");
+      if (propElements instanceof Y.Map) {
+        const value = propElements.get("value");
+        const targetMap = value instanceof Y.Map ? value : propElements;
+        for (const [elemId, elemData] of targetMap) {
+          if (elemId === "type") continue; // skip the type marker
+          const elem: Record<string, unknown> = { id: elemId };
+          if (elemData instanceof Y.Map) {
+            for (const [k, v] of elemData) {
+              if (v instanceof Y.Text) {
+                elem[k] = v.toString();
+              } else if (v instanceof Y.Map || v instanceof Y.Array) {
+                elem[k] = v.toJSON();
+              } else {
+                elem[k] = v;
+              }
+            }
+          } else if (typeof elemData === "object" && elemData !== null) {
+            Object.assign(elem, elemData);
+          }
+          elements.push(elem);
+        }
+      }
+
+      // Read children (embedded blocks on canvas)
+      const children = childIdsFrom(surfaceBlock.get("sys:children"));
+
+      // Also collect note blocks on the canvas (frame children etc.)
+      const canvasBlocks: Array<Record<string, unknown>> = [];
+      for (const childId of children) {
+        const childBlock = findBlockById(ctx.blocks, childId);
+        if (childBlock) {
+          canvasBlocks.push({
+            id: childId,
+            flavour: childBlock.get("sys:flavour"),
+            xywh: childBlock.get("prop:xywh") || null,
+          });
+        }
+      }
+
+      return text({
+        surfaceBlockId: surfaceId,
+        elementCount: elements.length,
+        elements,
+        canvasBlockCount: canvasBlocks.length,
+        canvasBlocks,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "get_edgeless_scene",
+    {
+      title: "Get Edgeless Scene",
+      description: "Read all elements from an AFFiNE document's edgeless canvas (surface block). Returns shapes, connectors, text elements, and embedded blocks with their positions and properties.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID to read edgeless elements from"),
+      },
+    },
+    getEdgelessSceneHandler as any
+  );
+
+  // ─── add_shape ────────────────────────────────────────────────────────────
+  const addShapeHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    shapeType: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    text?: string;
+    fillColor?: string;
+    strokeColor?: string;
+    strokeWidth?: number;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadEdgelessDocContext(workspaceId, parsed.docId);
+    try {
+      // Ensure surface block exists
+      const surfaceId = ensureSurfaceBlock(ctx.blocks);
+      const surfaceBlock = ctx.blocks.get(surfaceId) as Y.Map<any>;
+
+      let propElements = surfaceBlock.get("prop:elements");
+      if (!(propElements instanceof Y.Map)) {
+        propElements = new Y.Map<any>();
+        (propElements as Y.Map<any>).set("type", "$blocksuite:internal:native$");
+        (propElements as Y.Map<any>).set("value", new Y.Map<any>());
+        surfaceBlock.set("prop:elements", propElements);
+      }
+      let elementsValue = (propElements as Y.Map<any>).get("value");
+      if (!(elementsValue instanceof Y.Map)) {
+        elementsValue = new Y.Map<any>();
+        (propElements as Y.Map<any>).set("value", elementsValue);
+      }
+
+      const elementId = generateId();
+      const elementData = new Y.Map<any>();
+      elementData.set("id", elementId);
+      elementData.set("type", "shape");
+      elementData.set("xywh", `[${parsed.x},${parsed.y},${parsed.width},${parsed.height}]`);
+      elementData.set("shapeType", parsed.shapeType);
+      elementData.set("index", generateIndex((elementsValue as Y.Map<any>).size));
+      elementData.set("seed", Math.floor(Math.random() * 1000000));
+      elementData.set("radius", 0);
+      elementData.set("filled", true);
+      elementData.set("fillColor", parsed.fillColor || "--affine-palette-shape-yellow");
+      elementData.set("strokeWidth", parsed.strokeWidth ?? 4);
+      elementData.set("strokeColor", parsed.strokeColor || "--affine-palette-line-black");
+      elementData.set("strokeStyle", "solid");
+      elementData.set("roughness", 1.4);
+
+      if (parsed.text) {
+        const textData = new Y.Map<any>();
+        textData.set("type", "$blocksuite:internal:text$");
+        const yText = new Y.Text();
+        yText.insert(0, parsed.text);
+        textData.set("delta", yText);
+        elementData.set("text", textData);
+        elementData.set("textHorizontalAlign", "center");
+        elementData.set("textVerticalAlign", "center");
+        elementData.set("fontSize", 16);
+        elementData.set("fontFamily", "blocksuite:surface:sans");
+        elementData.set("color", "--affine-palette-line-black");
+      }
+
+      (elementsValue as Y.Map<any>).set(elementId, elementData);
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        added: true,
+        elementId,
+        shapeType: parsed.shapeType,
+        xywh: `[${parsed.x},${parsed.y},${parsed.width},${parsed.height}]`,
+        surfaceBlockId: surfaceId,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "add_shape",
+    {
+      title: "Add Shape to Edgeless Canvas",
+      description: "Add a shape element (rect, ellipse, diamond, triangle) to the edgeless canvas surface. Shapes can have fill color, stroke, and text content.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID (must be edgeless or have a surface block)"),
+        shapeType: z.enum(["rect", "ellipse", "diamond", "triangle"]).describe("Shape type"),
+        x: z.number().describe("X position on canvas"),
+        y: z.number().describe("Y position on canvas"),
+        width: z.number().describe("Shape width"),
+        height: z.number().describe("Shape height"),
+        text: z.string().optional().describe("Text content inside the shape"),
+        fillColor: z.string().optional().describe("Fill color (e.g. '--affine-palette-shape-yellow', '--affine-palette-shape-blue')"),
+        strokeColor: z.string().optional().describe("Stroke color (e.g. '--affine-palette-line-black')"),
+        strokeWidth: z.number().optional().describe("Stroke width in pixels (default: 4)"),
+      },
+    },
+    addShapeHandler as any
+  );
+
+  // ─── add_connector ────────────────────────────────────────────────────────
+  const addConnectorHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    sourceId: string;
+    targetId: string;
+    mode?: string;
+    strokeColor?: string;
+    strokeWidth?: number;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadEdgelessDocContext(workspaceId, parsed.docId);
+    try {
+      const { elementsMap, surfaceId } = getSurfaceElements(ctx.blocks);
+
+      // Verify source and target elements exist (in surface elements or as blocks)
+      const sourceInSurface = elementsMap.has(parsed.sourceId);
+      const sourceAsBlock = findBlockById(ctx.blocks, parsed.sourceId) !== null;
+      if (!sourceInSurface && !sourceAsBlock) {
+        throw new Error(`Source element '${parsed.sourceId}' not found in surface elements or blocks`);
+      }
+      const targetInSurface = elementsMap.has(parsed.targetId);
+      const targetAsBlock = findBlockById(ctx.blocks, parsed.targetId) !== null;
+      if (!targetInSurface && !targetAsBlock) {
+        throw new Error(`Target element '${parsed.targetId}' not found in surface elements or blocks`);
+      }
+
+      const elementId = generateId();
+      const connectorData = new Y.Map<any>();
+      connectorData.set("id", elementId);
+      connectorData.set("type", "connector");
+      connectorData.set("index", generateIndex(elementsMap.size));
+      connectorData.set("seed", Math.floor(Math.random() * 1000000));
+      connectorData.set("mode", parsed.mode === "straight" ? 1 : parsed.mode === "orthogonal" ? 2 : 0);
+      connectorData.set("strokeWidth", parsed.strokeWidth ?? 2);
+      connectorData.set("strokeColor", parsed.strokeColor || "--affine-palette-line-black");
+      connectorData.set("strokeStyle", "solid");
+      connectorData.set("roughness", 1.4);
+      connectorData.set("xywh", "[0,0,0,0]");
+
+      // Source connection
+      const source = new Y.Map<any>();
+      source.set("id", parsed.sourceId);
+      source.set("position", [0.5, 1]); // bottom center
+      connectorData.set("source", source);
+
+      // Target connection
+      const target = new Y.Map<any>();
+      target.set("id", parsed.targetId);
+      target.set("position", [0.5, 0]); // top center
+      connectorData.set("target", target);
+
+      elementsMap.set(elementId, connectorData);
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        added: true,
+        elementId,
+        sourceId: parsed.sourceId,
+        targetId: parsed.targetId,
+        surfaceBlockId: surfaceId,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "add_connector",
+    {
+      title: "Add Connector to Edgeless Canvas",
+      description: "Connect two elements on the edgeless canvas with a connector line. Source and target can be shapes or other surface elements. Connector auto-routes between element anchor points.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID (must have a surface block)"),
+        sourceId: z.string().min(1).describe("Element ID of the source (start of connector)"),
+        targetId: z.string().min(1).describe("Element ID of the target (end of connector)"),
+        mode: z.enum(["curve", "straight", "orthogonal"]).optional().describe("Connector routing mode (default: curve)"),
+        strokeColor: z.string().optional().describe("Stroke color (default: --affine-palette-line-black)"),
+        strokeWidth: z.number().optional().describe("Stroke width in pixels (default: 2)"),
+      },
+    },
+    addConnectorHandler as any
+  );
+
+  // ─── move_element ─────────────────────────────────────────────────────────
+  const moveElementHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    elementId: string;
+    x: number;
+    y: number;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadEdgelessDocContext(workspaceId, parsed.docId);
+    try {
+      // Try surface elements first
+      const surfaceId = findBlockIdByFlavour(ctx.blocks, "affine:surface");
+      let moved = false;
+      let oldXywh = "";
+      let newXywh = "";
+
+      if (surfaceId) {
+        const surfaceBlock = ctx.blocks.get(surfaceId) as Y.Map<any>;
+        const propElements = surfaceBlock.get("prop:elements");
+        if (propElements instanceof Y.Map) {
+          const value = propElements.get("value");
+          const targetMap = value instanceof Y.Map ? value : propElements;
+          const elemData = targetMap.get(parsed.elementId);
+          if (elemData instanceof Y.Map) {
+            oldXywh = elemData.get("xywh") || "[0,0,100,100]";
+            // Parse existing xywh to preserve width/height
+            const match = oldXywh.match(/\[?\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\]?/);
+            const w = match ? parseFloat(match[3]) : 100;
+            const h = match ? parseFloat(match[4]) : 100;
+            newXywh = `[${parsed.x},${parsed.y},${w},${h}]`;
+            elemData.set("xywh", newXywh);
+            moved = true;
+          }
+        }
+      }
+
+      // If not found in surface elements, try as a block (note, frame, etc.)
+      if (!moved) {
+        const block = findBlockById(ctx.blocks, parsed.elementId);
+        if (block) {
+          oldXywh = block.get("prop:xywh") || "[0,0,800,95]";
+          const match = oldXywh.match(/\[?\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\]?/);
+          const w = match ? parseFloat(match[3]) : 800;
+          const h = match ? parseFloat(match[4]) : 95;
+          newXywh = `[${parsed.x},${parsed.y},${w},${h}]`;
+          block.set("prop:xywh", newXywh);
+          moved = true;
+        }
+      }
+
+      if (!moved) {
+        throw new Error(`Element '${parsed.elementId}' not found in surface elements or blocks`);
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        moved: true,
+        elementId: parsed.elementId,
+        oldXywh,
+        newXywh,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "move_element",
+    {
+      title: "Move Edgeless Element",
+      description: "Move an element on the edgeless canvas to a new x,y position. Works with surface elements (shapes, connectors) and canvas blocks (notes, frames). Preserves the element's width and height.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID"),
+        elementId: z.string().min(1).describe("Element ID or block ID to move"),
+        x: z.number().describe("New X position"),
+        y: z.number().describe("New Y position"),
+      },
+    },
+    moveElementHandler as any
+  );
+
+  // ─── delete_element ───────────────────────────────────────────────────────
+  const deleteElementHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    elementId: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadEdgelessDocContext(workspaceId, parsed.docId);
+    try {
+      let deleted = false;
+      let deletedFrom = "";
+
+      // Try surface elements first
+      const surfaceId = findBlockIdByFlavour(ctx.blocks, "affine:surface");
+      if (surfaceId) {
+        const surfaceBlock = ctx.blocks.get(surfaceId) as Y.Map<any>;
+        const propElements = surfaceBlock.get("prop:elements");
+        if (propElements instanceof Y.Map) {
+          const value = propElements.get("value");
+          const targetMap = value instanceof Y.Map ? value : propElements;
+          if (targetMap.has(parsed.elementId)) {
+            targetMap.delete(parsed.elementId);
+            deleted = true;
+            deletedFrom = "surface_elements";
+          }
+        }
+
+        // Also remove from surface children if present
+        if (!deleted) {
+          const surfChildren = surfaceBlock.get("sys:children");
+          if (surfChildren instanceof Y.Array) {
+            const idx = indexOfChild(surfChildren, parsed.elementId);
+            if (idx >= 0) {
+              surfChildren.delete(idx, 1);
+            }
+          }
+        }
+      }
+
+      // If not found in surface elements, also try removing connectors pointing to it
+      // (cleanup: remove connectors whose source or target is this element)
+      if (deleted && surfaceId) {
+        const surfaceBlock = ctx.blocks.get(surfaceId) as Y.Map<any>;
+        const propElements = surfaceBlock.get("prop:elements");
+        if (propElements instanceof Y.Map) {
+          const value = propElements.get("value");
+          const targetMap = value instanceof Y.Map ? value : propElements;
+          const connectorsToRemove: string[] = [];
+          for (const [connId, connData] of targetMap) {
+            if (connData instanceof Y.Map && connData.get("type") === "connector") {
+              const src = connData.get("source");
+              const tgt = connData.get("target");
+              const srcId = src instanceof Y.Map ? src.get("id") : src?.id;
+              const tgtId = tgt instanceof Y.Map ? tgt.get("id") : tgt?.id;
+              if (srcId === parsed.elementId || tgtId === parsed.elementId) {
+                connectorsToRemove.push(connId);
+              }
+            }
+          }
+          for (const connId of connectorsToRemove) {
+            targetMap.delete(connId);
+          }
+        }
+      }
+
+      if (!deleted) {
+        throw new Error(`Element '${parsed.elementId}' not found in surface elements`);
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        deleted: true,
+        elementId: parsed.elementId,
+        deletedFrom,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "delete_element",
+    {
+      title: "Delete Edgeless Element",
+      description: "Remove an element from the edgeless canvas surface. Also removes any connectors that reference the deleted element. Works with shapes, connectors, and other surface elements.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID"),
+        elementId: z.string().min(1).describe("Element ID to delete from the surface"),
+      },
+    },
+    deleteElementHandler as any
+  );
 }
