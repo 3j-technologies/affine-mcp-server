@@ -1,5 +1,5 @@
 {
-  "version": "1.10.1",
+  "version": "1.11.0",
   "tools": [
     "add_database_column",
     "add_database_row",
@@ -7,10 +7,12 @@
     "append_block",
     "append_markdown",
     "append_paragraph",
+    "batch_add_database_rows",
     "batch_create_docs",
     "cleanup_blobs",
     "cleanup_orphan_embeds",
     "create_comment",
+    "create_database_with_schema",
     "create_doc",
     "create_doc_from_markdown",
     "create_doc_from_template",
@@ -55,6 +57,8 @@
     "revoke_access_token",
     "revoke_doc",
     "search_docs",
+    "set_database_view_filter",
+    "set_database_view_sort",
     "sign_in",
     "update_comment",
     "update_database_cell",

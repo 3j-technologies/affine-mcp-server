@@ -5121,6 +5121,482 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     addDatabaseColumnHandler as any
   );
 
+  // ─── batch_add_database_rows ──────────────────────────────────────────────
+  const batchAddDatabaseRowsHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    rows: Array<Record<string, unknown>>;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    if (!parsed.rows.length) throw new Error("rows array must not be empty");
+
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const addedRows: Array<{ rowBlockId: string; cellCount: number }> = [];
+
+      for (const rowData of parsed.rows) {
+        const rowBlockId = generateId();
+        const rowBlock = new Y.Map<any>();
+        setSysFields(rowBlock, rowBlockId, "affine:paragraph");
+        rowBlock.set("sys:parent", parsed.databaseBlockId);
+        rowBlock.set("sys:children", new Y.Array<string>());
+        rowBlock.set("prop:type", "text");
+        const titleValue = resolveDatabaseTitleValue(rowData, ctx);
+        rowBlock.set("prop:text", makeText(String(titleValue)));
+        ctx.blocks.set(rowBlockId, rowBlock);
+
+        // Add row block to database's children
+        const dbChildren = ensureChildrenArray(ctx.dbBlock);
+        dbChildren.push([rowBlockId]);
+
+        // Create row cell map
+        const rowCells = ensureDatabaseRowCells(ctx.cellsMap, rowBlockId);
+        for (const [key, value] of Object.entries(rowData)) {
+          const col = findDatabaseColumn(key, ctx);
+          if (!col) {
+            if (isTitleAliasKey(key)) {
+              continue;
+            }
+            throw new Error(`Column '${key}' not found in row ${addedRows.length + 1}. Available columns: ${availableDatabaseColumns(ctx)}`);
+          }
+          writeDatabaseCellValue(rowCells, col, value, true);
+        }
+
+        addedRows.push({ rowBlockId, cellCount: Object.keys(rowData).length });
+      }
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        added: true,
+        databaseBlockId: parsed.databaseBlockId,
+        rowCount: addedRows.length,
+        rows: addedRows,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "batch_add_database_rows",
+    {
+      title: "Batch Add Database Rows",
+      description: "Add multiple rows to an AFFiNE database block in a single operation. Much more efficient than calling add_database_row multiple times. Each row is a map of column name (or column ID) to cell value.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        rows: z.array(z.record(z.unknown())).min(1).describe("Array of row objects. Each object maps column name (or column ID) to cell value. Use 'title' key for the row title."),
+      },
+    },
+    batchAddDatabaseRowsHandler as any
+  );
+
+  // ─── set_database_view_filter ─────────────────────────────────────────────
+  const setDatabaseViewFilterHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    viewId?: string;
+    filter: {
+      type: "group";
+      op: "and" | "or";
+      conditions: Array<{
+        type: "filter";
+        left: { type: "ref"; name: string };
+        function: string;
+        args: unknown[];
+      }>;
+    };
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const views = ctx.dbBlock.get("prop:views");
+      if (!(views instanceof Y.Array)) throw new Error("Database has no views");
+
+      // Find the target view
+      let targetView: Y.Map<any> | null = null;
+      views.forEach((view: any) => {
+        if (view instanceof Y.Map) {
+          if (parsed.viewId) {
+            if (view.get("id") === parsed.viewId) targetView = view;
+          } else if (!targetView) {
+            targetView = view; // default to first view
+          }
+        }
+      });
+      if (!targetView) throw new Error(parsed.viewId ? `View '${parsed.viewId}' not found` : "No views found on database");
+
+      // Resolve column names to IDs in filter conditions
+      const resolvedConditions = parsed.filter.conditions.map((cond, idx) => {
+        const col = findDatabaseColumn(cond.left.name, ctx);
+        if (!col) {
+          throw new Error(`Filter condition ${idx + 1}: column '${cond.left.name}' not found. Available columns: ${availableDatabaseColumns(ctx)}`);
+        }
+
+        // For select/multi-select filters, resolve option labels to IDs
+        const resolvedArgs = cond.args.map(arg => {
+          if (typeof arg === "string" && (col.type === "select" || col.type === "multi-select")) {
+            const option = col.options.find(o => o.value === arg);
+            if (option) return option.id;
+          }
+          return arg;
+        });
+
+        return {
+          type: "filter",
+          left: { type: "ref", name: col.id },
+          function: cond.function,
+          args: resolvedArgs,
+        };
+      });
+
+      const filterObj = {
+        type: "group",
+        op: parsed.filter.op,
+        conditions: resolvedConditions,
+      };
+
+      (targetView as Y.Map<any>).set("filter", filterObj);
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        updated: true,
+        databaseBlockId: parsed.databaseBlockId,
+        viewId: (targetView as Y.Map<any>).get("id"),
+        filterConditionCount: resolvedConditions.length,
+        filterOp: parsed.filter.op,
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "set_database_view_filter",
+    {
+      title: "Set Database View Filter",
+      description: "Set filter conditions on an AFFiNE database view. Filters control which rows are visible. Supports AND/OR grouping. Column names are resolved to IDs automatically. Select option labels are resolved to option IDs. Common filter functions: 'contains', 'doesNotContain', 'is', 'isNot', 'isEmpty', 'isNotEmpty', 'isGreaterThan', 'isLessThan', 'isBefore', 'isAfter'. Pass an empty conditions array to clear the filter.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        viewId: z.string().optional().describe("View ID to modify (defaults to first view)"),
+        filter: z.object({
+          type: z.literal("group"),
+          op: z.enum(["and", "or"]).describe("Logical operator combining conditions"),
+          conditions: z.array(z.object({
+            type: z.literal("filter"),
+            left: z.object({
+              type: z.literal("ref"),
+              name: z.string().describe("Column name or column ID"),
+            }),
+            function: z.string().describe("Filter function: contains, doesNotContain, is, isNot, isEmpty, isNotEmpty, isGreaterThan, isLessThan, isBefore, isAfter, etc."),
+            args: z.array(z.unknown()).describe("Filter arguments. For 'is'/'isNot' on select columns, pass the option label string."),
+          })).describe("Filter conditions"),
+        }).describe("Filter definition with grouped conditions"),
+      },
+    },
+    setDatabaseViewFilterHandler as any
+  );
+
+  // ─── set_database_view_sort ───────────────────────────────────────────────
+  const setDatabaseViewSortHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    databaseBlockId: string;
+    viewId?: string;
+    sorts: Array<{
+      column: string;
+      order: "asc" | "desc";
+    }>;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const ctx = await loadDatabaseDocContext(workspaceId, parsed.docId, parsed.databaseBlockId);
+    try {
+      const views = ctx.dbBlock.get("prop:views");
+      if (!(views instanceof Y.Array)) throw new Error("Database has no views");
+
+      // Find the target view
+      let targetView: Y.Map<any> | null = null;
+      views.forEach((view: any) => {
+        if (view instanceof Y.Map) {
+          if (parsed.viewId) {
+            if (view.get("id") === parsed.viewId) targetView = view;
+          } else if (!targetView) {
+            targetView = view;
+          }
+        }
+      });
+      if (!targetView) throw new Error(parsed.viewId ? `View '${parsed.viewId}' not found` : "No views found on database");
+
+      // Resolve column names to IDs
+      const resolvedSorts = parsed.sorts.map((sortEntry, idx) => {
+        const col = findDatabaseColumn(sortEntry.column, ctx);
+        if (!col) {
+          throw new Error(`Sort entry ${idx + 1}: column '${sortEntry.column}' not found. Available columns: ${availableDatabaseColumns(ctx)}`);
+        }
+        return {
+          id: col.id,
+          desc: sortEntry.order === "desc",
+        };
+      });
+
+      const sortObj = {
+        columns: resolvedSorts,
+        manuallySort: false,
+      };
+
+      (targetView as Y.Map<any>).set("sort", sortObj);
+
+      const delta = Y.encodeStateAsUpdate(ctx.doc, ctx.prevSV);
+      await pushDocUpdate(ctx.socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        updated: true,
+        databaseBlockId: parsed.databaseBlockId,
+        viewId: (targetView as Y.Map<any>).get("id"),
+        sortCount: resolvedSorts.length,
+        sorts: resolvedSorts.map(s => ({ columnId: s.id, desc: s.desc })),
+      });
+    } finally {
+      ctx.socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "set_database_view_sort",
+    {
+      title: "Set Database View Sort",
+      description: "Set sort order on an AFFiNE database view. Controls how rows are ordered. Multiple sort columns are applied in order (primary sort first). Column names are resolved to IDs automatically. Pass an empty sorts array to clear sorting.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID containing the database"),
+        databaseBlockId: z.string().min(1).describe("Block ID of the affine:database block"),
+        viewId: z.string().optional().describe("View ID to modify (defaults to first view)"),
+        sorts: z.array(z.object({
+          column: z.string().describe("Column name or column ID to sort by"),
+          order: z.enum(["asc", "desc"]).describe("Sort direction: ascending or descending"),
+        })).describe("Array of sort definitions, applied in order (primary sort first)"),
+      },
+    },
+    setDatabaseViewSortHandler as any
+  );
+
+  // ─── create_database_with_schema ──────────────────────────────────────────
+  const createDatabaseWithSchemaHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    title?: string;
+    columns: Array<{
+      name: string;
+      type: string;
+      options?: string[];
+      width?: number;
+    }>;
+    rows?: Array<Record<string, unknown>>;
+    viewMode?: string;
+    parentBlockId?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (snapshot.missing) {
+        Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      }
+
+      const prevSV = Y.encodeStateVector(doc);
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      // Find the parent block (note block) to insert the database into
+      let parentBlock: Y.Map<any> | null = null;
+      if (parsed.parentBlockId) {
+        parentBlock = findBlockById(blocks, parsed.parentBlockId);
+        if (!parentBlock) throw new Error(`Parent block '${parsed.parentBlockId}' not found`);
+      } else {
+        // Find the first note block as default parent
+        for (const [, block] of blocks) {
+          if (block instanceof Y.Map && block.get("sys:flavour") === "affine:note") {
+            parentBlock = block;
+            break;
+          }
+        }
+        if (!parentBlock) throw new Error("No note block found in document to insert database into");
+      }
+
+      // Create the database block
+      const dbBlockId = generateId();
+      const dbBlock = new Y.Map<any>();
+      setSysFields(dbBlock, dbBlockId, "affine:database");
+      dbBlock.set("sys:parent", parentBlock.get("sys:id") || null);
+      dbBlock.set("sys:children", new Y.Array<string>());
+
+      // Build column definitions
+      const columnsArray = new Y.Array<any>();
+      const columnDefs: Array<{ id: string; name: string; type: string; options: Array<{ id: string; value: string; color: string }>; raw: Y.Map<any> }> = [];
+
+      for (const colDef of parsed.columns) {
+        const columnId = generateId();
+        const column = new Y.Map<any>();
+        column.set("id", columnId);
+        column.set("name", colDef.name);
+        column.set("type", colDef.type || "rich-text");
+        column.set("width", colDef.width || 200);
+
+        const colOptions: Array<{ id: string; value: string; color: string }> = [];
+        if ((colDef.type === "select" || colDef.type === "multi-select") && colDef.options?.length) {
+          const data = new Y.Map<any>();
+          const opts = new Y.Array<any>();
+          for (let i = 0; i < colDef.options.length; i++) {
+            const optMap = new Y.Map<any>();
+            const optId = generateId();
+            optMap.set("id", optId);
+            optMap.set("value", colDef.options[i]);
+            optMap.set("color", SELECT_COLORS[i % SELECT_COLORS.length]);
+            opts.push([optMap]);
+            colOptions.push({ id: optId, value: colDef.options[i], color: SELECT_COLORS[i % SELECT_COLORS.length] });
+          }
+          data.set("options", opts);
+          column.set("data", data);
+        }
+
+        columnsArray.push([column]);
+        columnDefs.push({ id: columnId, name: colDef.name, type: colDef.type || "rich-text", options: colOptions, raw: column });
+      }
+
+      dbBlock.set("prop:columns", columnsArray);
+
+      // Create the default view with columns visible
+      const defaultView = new Y.Map<any>();
+      const viewId = generateId();
+      defaultView.set("id", viewId);
+      defaultView.set("name", "Table View");
+      defaultView.set("mode", parsed.viewMode === "kanban" ? "kanban" : "table");
+
+      const viewColumns = new Y.Array<any>();
+      for (const colDef of columnDefs) {
+        const viewCol = new Y.Map<any>();
+        viewCol.set("id", colDef.id);
+        viewCol.set("hide", false);
+        viewCol.set("width", 200);
+        viewColumns.push([viewCol]);
+      }
+      defaultView.set("columns", viewColumns);
+      defaultView.set("filter", { type: "group", op: "and", conditions: [] });
+      defaultView.set("groupBy", null);
+      defaultView.set("sort", null);
+      defaultView.set("header", { titleColumn: null, iconColumn: null });
+
+      const viewsArray = new Y.Array<any>();
+      viewsArray.push([defaultView]);
+      dbBlock.set("prop:views", viewsArray);
+
+      dbBlock.set("prop:title", makeText(parsed.title || ""));
+      const cellsMap = new Y.Map<any>();
+      dbBlock.set("prop:cells", cellsMap);
+      dbBlock.set("prop:comments", undefined);
+
+      blocks.set(dbBlockId, dbBlock);
+
+      // Add database block as child of parent
+      const parentChildren = ensureChildrenArray(parentBlock);
+      parentChildren.push([dbBlockId]);
+
+      // Build lookup for row insertion
+      const colById = new Map(columnDefs.map(c => [c.id, c]));
+      const colByName = new Map(columnDefs.map(c => [c.name, c]));
+      const colByNameLower = new Map(columnDefs.map(c => [c.name.trim().toLowerCase(), c]));
+      const titleCol = columnDefs.find(c => c.type === "title") || null;
+      const lookup: DatabaseColumnLookup = { columnDefs, colById, colByName, colByNameLower, titleCol };
+
+      // Add initial rows if provided
+      const addedRows: Array<{ rowBlockId: string; cellCount: number }> = [];
+      if (parsed.rows?.length) {
+        for (const rowData of parsed.rows) {
+          const rowBlockId = generateId();
+          const rowBlock = new Y.Map<any>();
+          setSysFields(rowBlock, rowBlockId, "affine:paragraph");
+          rowBlock.set("sys:parent", dbBlockId);
+          rowBlock.set("sys:children", new Y.Array<string>());
+          rowBlock.set("prop:type", "text");
+          const titleValue = resolveDatabaseTitleValue(rowData, lookup);
+          rowBlock.set("prop:text", makeText(String(titleValue)));
+          blocks.set(rowBlockId, rowBlock);
+
+          const dbChildren = ensureChildrenArray(dbBlock);
+          dbChildren.push([rowBlockId]);
+
+          const rowCells = new Y.Map<any>();
+          cellsMap.set(rowBlockId, rowCells);
+
+          for (const [key, value] of Object.entries(rowData)) {
+            const col = findDatabaseColumn(key, lookup);
+            if (!col) {
+              if (isTitleAliasKey(key)) continue;
+              throw new Error(`Column '${key}' not found in row ${addedRows.length + 1}. Available columns: ${availableDatabaseColumns(lookup)}`);
+            }
+            writeDatabaseCellValue(rowCells, col, value, true);
+          }
+
+          addedRows.push({ rowBlockId, cellCount: Object.keys(rowData).length });
+        }
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      return text({
+        created: true,
+        databaseBlockId: dbBlockId,
+        viewId,
+        columnCount: columnDefs.length,
+        columns: columnDefs.map(c => ({ id: c.id, name: c.name, type: c.type })),
+        rowCount: addedRows.length,
+        rows: addedRows,
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "create_database_with_schema",
+    {
+      title: "Create Database with Schema",
+      description: "Create a complete AFFiNE database block with columns and optional initial rows in a single call. Much more efficient than creating a database, adding columns, then adding rows separately. Ideal for financial dashboards, project trackers, and structured data.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        docId: DocId.describe("Document ID to insert the database into"),
+        title: z.string().optional().describe("Database title"),
+        columns: z.array(z.object({
+          name: z.string().describe("Column display name"),
+          type: z.enum(["rich-text", "select", "multi-select", "number", "checkbox", "link", "date", "title"]).default("rich-text").describe("Column type"),
+          options: z.array(z.string()).optional().describe("Predefined options for select/multi-select columns"),
+          width: z.number().optional().describe("Column width in pixels (default 200)"),
+        })).min(1).describe("Column definitions for the database schema"),
+        rows: z.array(z.record(z.unknown())).optional().describe("Optional initial rows. Each row is a map of column name to cell value. Use 'title' for the row title."),
+        viewMode: z.enum(["table", "kanban"]).optional().describe("Default view mode (default: table)"),
+        parentBlockId: z.string().optional().describe("Optional parent block ID. Defaults to the first note block in the document."),
+      },
+    },
+    createDatabaseWithSchemaHandler as any
+  );
+
   // ─── create_journal_entry ─────────────────────────────────────────────────
   const createJournalEntryHandler = async (parsed: {
     workspaceId?: string;
