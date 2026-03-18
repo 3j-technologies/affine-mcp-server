@@ -14,6 +14,8 @@
     "create_doc",
     "create_doc_from_markdown",
     "create_doc_from_template",
+    "create_journal_entry",
+    "create_linked_database_view",
     "create_tag",
     "create_workspace",
     "current_user",

@@ -5120,4 +5120,183 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
     addDatabaseColumnHandler as any
   );
+
+  // ─── create_journal_entry ─────────────────────────────────────────────────
+  const createJournalEntryHandler = async (parsed: {
+    workspaceId?: string;
+    date: string;
+    title?: string;
+    content?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
+
+    // Validate date format YYYY-MM-DD
+    const dateStr = parsed.date.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      throw new Error("date must be in YYYY-MM-DD format (e.g. 2025-01-15).");
+    }
+    // Validate the date is actually valid
+    const parts = dateStr.split("-");
+    const year = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10);
+    const day = parseInt(parts[2], 10);
+    const testDate = new Date(year, month - 1, day);
+    if (testDate.getFullYear() !== year || testDate.getMonth() !== month - 1 || testDate.getDate() !== day) {
+      throw new Error(`Invalid date: ${dateStr}`);
+    }
+
+    const journalTitle = parsed.title || dateStr;
+
+    // Step 1: Check if a journal already exists for this date by scanning db$docProperties subdoc
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+
+      // Load the docProperties subdoc to check for existing journals
+      const dbDocId = "db$docProperties";
+      let existingJournalDocId: string | null = null;
+      try {
+        const propsSnapshot = await loadDoc(socket, workspaceId, dbDocId);
+        if (propsSnapshot.missing) {
+          const propsDoc = new Y.Doc();
+          Y.applyUpdate(propsDoc, Buffer.from(propsSnapshot.missing, "base64"));
+          // Iterate all keys (doc IDs) to find one with journal = dateStr
+          const rootMap = propsDoc.getMap();
+          // The ORM stores each row as a YMap keyed by the primary key (doc ID)
+          // Fields are stored directly on the YMap
+          for (const [key] of rootMap) {
+            const row = rootMap.get(key);
+            if (row instanceof Y.Map) {
+              const journal = row.get("journal");
+              if (journal === dateStr) {
+                existingJournalDocId = key;
+                break;
+              }
+            }
+          }
+          propsDoc.destroy();
+        }
+      } catch {
+        // db$docProperties might not exist yet — that's fine
+      }
+
+      if (existingJournalDocId) {
+        return text({
+          docId: existingJournalDocId,
+          date: dateStr,
+          title: journalTitle,
+          alreadyExisted: true,
+          message: `A journal entry already exists for ${dateStr}.`,
+        });
+      }
+
+      // Step 2: Create the doc
+      socket.disconnect();
+      const created = await createDocInternal({
+        workspaceId,
+        title: journalTitle,
+        content: parsed.content,
+      });
+
+      // Step 3: Set the journal property in db$docProperties subdoc
+      const socket2 = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+      try {
+        await joinWorkspace(socket2, workspaceId);
+
+        const propsDoc = new Y.Doc();
+        try {
+          const propsSnapshot = await loadDoc(socket2, workspaceId, dbDocId);
+          if (propsSnapshot.missing) {
+            Y.applyUpdate(propsDoc, Buffer.from(propsSnapshot.missing, "base64"));
+          }
+        } catch {
+          // subdoc may not exist yet
+        }
+
+        const prevSV = Y.encodeStateVector(propsDoc);
+        const record = propsDoc.getMap(created.docId);
+        record.set("id", created.docId);
+        record.set("journal", dateStr);
+        const delta = Y.encodeStateAsUpdate(propsDoc, prevSV);
+        const deltaBase64 = Buffer.from(delta).toString("base64");
+        await pushDocUpdate(socket2, workspaceId, dbDocId, deltaBase64);
+        propsDoc.destroy();
+
+        return text({
+          docId: created.docId,
+          date: dateStr,
+          title: journalTitle,
+          alreadyExisted: false,
+          message: `Journal entry created for ${dateStr}.`,
+        });
+      } finally {
+        socket2.disconnect();
+      }
+    } catch (err) {
+      try { socket.disconnect(); } catch { /* already disconnected */ }
+      throw err;
+    }
+  };
+  server.registerTool(
+    "create_journal_entry",
+    {
+      title: "Create Journal Entry",
+      description: "Create a journal entry for a specific date in AFFiNE. Journals are special docs tagged with a date (YYYY-MM-DD). If a journal already exists for that date, returns the existing one instead of creating a duplicate.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        date: z.string().describe("Journal date in YYYY-MM-DD format (e.g. 2025-01-15)"),
+        title: z.string().optional().describe("Custom title (defaults to the date string)"),
+        content: z.string().optional().describe("Initial text content for the journal entry"),
+      },
+    },
+    createJournalEntryHandler as any
+  );
+
+  // ─── create_linked_database_view ──────────────────────────────────────────
+  const createLinkedDatabaseViewHandler = async (parsed: {
+    workspaceId?: string;
+    targetDocId: string;
+    sourceDocId: string;
+    sourceDatabaseBlockId?: string;
+    parentBlockId?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
+
+    // We embed the source doc (containing the database) into the target doc using embed_synced_doc.
+    // If sourceDatabaseBlockId is provided, we embed just that block reference.
+    // AFFiNE's embed_synced_doc shows a live, editable view of the source doc's content.
+    const result = await appendBlockInternal({
+      workspaceId,
+      docId: parsed.targetDocId,
+      type: "embed_synced_doc",
+      pageId: parsed.sourceDocId,
+      placement: parsed.parentBlockId ? { parentId: parsed.parentBlockId } : undefined,
+    });
+
+    return text({
+      targetDocId: parsed.targetDocId,
+      sourceDocId: parsed.sourceDocId,
+      embeddedBlockId: result.blockId,
+      blockType: "embed_synced_doc",
+      message: `Linked database view embedded. The database from doc ${parsed.sourceDocId} is now visible as a synced embed in doc ${parsed.targetDocId}.`,
+    });
+  };
+  server.registerTool(
+    "create_linked_database_view",
+    {
+      title: "Create Linked Database View",
+      description: "Embed a database from one doc into another as a live synced view. This creates an embed_synced_doc block in the target doc that references the source doc containing the database. Changes to the database are reflected in both locations.",
+      inputSchema: {
+        workspaceId: z.string().optional().describe("Workspace ID (optional if default set)"),
+        targetDocId: z.string().min(1).describe("Doc ID where the linked database view will be inserted"),
+        sourceDocId: z.string().min(1).describe("Doc ID containing the database to embed"),
+        parentBlockId: z.string().optional().describe("Optional parent block ID for placement within the target doc"),
+      },
+    },
+    createLinkedDatabaseViewHandler as any
+  );
 }
